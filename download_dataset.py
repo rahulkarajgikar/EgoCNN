@@ -2,6 +2,9 @@ import os
 import optparse
 import urllib.request
 import zipfile
+import ssl
+
+ssl._create_default_https_context = ssl._create_unverified_context
 
 """
 Download Graph Classification datasets 

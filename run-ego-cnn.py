@@ -49,23 +49,30 @@ def parse_arg():
     parser.add_option('-m', dest='model_type', default='6L', help="specify which model to use in one of ['6L', '2L', '6L_SF', '3L']")
     (options, args) = parser.parse_args()
     return options
+
 def prepare_G(G_adj, G_nbr, G_nn, G_att, V_num, E_map, N_map, k, dim_f, dim_a, pk=10):
     """
     padded each graph with same # of nodes,
     and each node with same # of neighbors
     --------------------------------------
     return
-        adjs: 1 x (|V|+1) x (k x k)
-        nbrs: 1 x (|V|+1) x k
-        nnlbls: 1 x (|V|+1) x (k x dim_f)
+        adjs: 1 x (|V|+1) x (k x k) [for each vertex, k*k adjacency matrix]
+        nbrs: 1 x (|V|+1) x k [for each vertex, k nearest neighbours]
+        nnlbls: 1 x (|V|+1) x (k x dim_f) [for each vertex, the weight matrix k*d.i think]
     """
     dim_e = len(E_map)
     adjs, nbrs, nnlbls, atts = [], [], [], []
+    #create padding things
     pad_adj, pad_nn, pad_att, pad_nbr = np.zeros((pk,pk,dim_e)).reshape((-1)), np.zeros((pk,dim_f)).reshape((-1)), np.zeros((pk,dim_a)).reshape((-1)), np.zeros(k)
+    
+    #perform relevant padding?
+    #Adj is adjacency map of a specific node?
     for Adj, Nbr in zip(G_adj, G_nbr):
         adj, nbr, nn, att = [pad_adj], [pad_nbr], [pad_nn], [pad_att]
         for i in range(V_num):
+            #if node i is a neighbour of current node [Adj]
             if i in Adj.keys():
+                #convert Adj into a onehot labeling, using E_map, 
                 adj.append(onehot(Adj[i].reshape((1,-1)).astype(np.int32), E_map).reshape((-1)))
                 nbr.append(np.array([j+1 for j in Nbr[i]]))
                 nnl = onehot(G_nn[i], N_map)
@@ -87,6 +94,7 @@ def prepare_G(G_adj, G_nbr, G_nn, G_att, V_num, E_map, N_map, k, dim_f, dim_a, p
         nnlbls.append(nn)
         atts.append(att)
     return np.array(adjs), np.array(nbrs).astype(np.int32), np.array(nnlbls), np.array(atts)
+
 def onehot(labels, Y_map):
     """onehot encoding labels"""
     labels = np.array(labels).reshape((-1))
@@ -96,6 +104,7 @@ def onehot(labels, Y_map):
         if labels[i] in Y_map.keys():
             rst[i,Y_map[labels[i]]] = 1
     return rst.astype(np.int32)
+
 def batch_generator(adjs, nbrs, nnlbls, atts, labels, N_map, E_map, Y_map, V_num=28, bsize=32, dim_f=0, dim_a=0, dim_e=0, nY=2, k=3, pk=10):
     """graph is processed(add padding) as needed"""
     epch = 0
@@ -111,10 +120,14 @@ def batch_generator(adjs, nbrs, nnlbls, atts, labels, N_map, E_map, Y_map, V_num
             att = np.swapaxes(att, 0,1).reshape((1, bsize, V_num+1, pk*dim_a))
             yield [adj, nbr, nnlbl, att, lbls, epch]
         epch += 1
+        
+#generates a random tensor with customizable shape from a normal distribution
 def xavier_init(size):
     return tf.random_normal(shape=size, stddev=1./tf.sqrt(size[0]/2.))
+
 def xavier_init_val(size):
     return np.random.normal(size=size, scale=1./np.sqrt(size[0]/2.))
+
 def bn(X, eps=1e-8, g=None, b=None):
     if X.get_shape().ndims == 4:
         mean = tf.reduce_mean(X, [0,1,2])
@@ -133,6 +146,7 @@ def bn(X, eps=1e-8, g=None, b=None):
     else:
         raise NotImplementedError
     return X
+
 def aggregate_nbr(pb_nbr_dict, pb_fmap, k):
     """
     nbr_dict: [1, bsize, nV, k]
@@ -144,6 +158,8 @@ def aggregate_nbr(pb_nbr_dict, pb_fmap, k):
              for b_nbr_dict, b_fmap in zip(tf.unstack(pb_nbr_dict), tf.unstack(pb_fmap))\
              for nbr_dict, fmap in zip(tf.unstack(b_nbr_dict), tf.unstack(b_fmap))
             ]])
+
+'''theta represents weights in the layer'''
 def g_conv_bn(X, theta, shape):
     """
     X: [1, bsize, nV, n1] => [1, bsize*nV, n1] == swap-axis ==> [bsize*nV, n1]
@@ -154,6 +170,18 @@ def g_conv_bn(X, theta, shape):
     X = tf.reshape(tf.transpose(tf.reshape(X, [1, bsize*nV, -1]), [1,0,2]), [bsize*nV, -1])
     XW = tf.reshape(tf.transpose(tf.reshape(tf.nn.relu(bn(tf.matmul(X, theta[0])+theta[1])), [bsize*nV, 1, n2]), [1,0,2]), [1, bsize, nV, n2])
     return XW
+
+'''
+chooses which model type to use
+k = k in ego cnn
+pk = k in patchy san
+dim_f = no of neighbour labels
+dim_a = atts[0][0].shape[1] [no of attributes?]
+dim_e = no of edge labels
+nV  = max number of neighbours of a node [Max degree]
+nY = no of unique labels?
+bsize = batch size (will be max 32 by default)
+'''
 def build_model(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10, model_type='6L'):
     """switch experiment models"""
     if model_type == '2L': # Patchy-San + 1 Ego-Convolution for scale-free regularizer exp
@@ -164,6 +192,8 @@ def build_model(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10, model_type
         return model_3L(nV, dim_f, dim_a, dim_e, bsize=bsize, k=k, nY=nY, pk=pk)
     # [default] Patchy-San + 5 Ego-Convolution (without weight-tying) for graph classificaiton exp
     return model_6L(nV, dim_f, dim_a, dim_e, bsize=bsize, k=k, nY=nY, pk=pk)
+
+'''model with 6 ego convolution layers'''
 def model_6L(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10):
     adj = tf.placeholder(tf.float32, [1,bsize,nV,pk*pk*dim_e])
     nnlbl = tf.placeholder(tf.float32, [1,bsize,nV,pk*dim_f])
@@ -171,6 +201,8 @@ def model_6L(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10):
     nbr = tf.placeholder(tf.int32, [1,bsize,nV,k]) # |V| x k
     label = tf.placeholder(tf.float32, [bsize,nY])
     n1, n2, n3, n4, n5, n6, f1, remain_rate = 128, 128, 128, 128, 128, 128, 256, 0.8
+    
+    #randomly generate initial weights
     cv1_theta = [tf.Variable(xavier_init([pk*(pk*dim_e+dim_f+dim_a), n1])), tf.Variable(tf.zeros(shape=[n1]))]
     cv2_theta = [tf.Variable(xavier_init([n1*k, n2])), tf.Variable(tf.zeros(shape=[n2]))]
     cv3_theta = [tf.Variable(xavier_init([n2*k, n3])), tf.Variable(tf.zeros(shape=[n3]))]
@@ -203,6 +235,30 @@ def model_6L(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10):
     x = tf.nn.dropout(x, remain_rate)
     out = tf.matmul(x, fc2_theta[0]) + fc2_theta[1]
     return adj, nbr, nnlbl, att, label, out, params
+
+'''
+model with 2 ego conv layers
+
+patchy san at the start generates first hidden representation from the adjacency matrices
+from there on egoCNN algo does the work
+
+variables:
+k = k in ego cnn (no of neighbours considered in neighbourhood)
+pk = k in patchy san
+dim_f = no of neighbour labels
+dim_a = atts[0][0].shape[1] [no of attributes?]
+dim_e = no of edge labels
+nV  = max number of neighbours of a node [Max degree]
+nY = no of unique labels?
+bsize = batch size (will be max 32 by default)\
+
+
+cv1_theta = weights for first convolution (cv) layer
+cv2_theta = weights for second convolution (cv) layer
+fc1_theta = weights for first fully connected (fc) layer
+fc2_theta = weights for second fully connected (fc) layer
+
+'''
 def model_2L(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10):
     adj = tf.placeholder(tf.float32, [1,bsize,nV,pk*pk*dim_e])
     nnlbl = tf.placeholder(tf.float32, [1,bsize,nV,pk*dim_f])
@@ -230,6 +286,7 @@ def model_2L(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10):
     x = tf.nn.dropout(x, remain_rate)
     out = tf.matmul(x, fc2_theta[0]) + fc2_theta[1]
     return adj, nbr, nnlbl, att, label, out, params
+
 def model_6L_SF(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10):
     adj = tf.placeholder(tf.float32, [1,bsize,nV,pk*pk*dim_e])
     nnlbl = tf.placeholder(tf.float32, [1,bsize,nV,pk*dim_f])
@@ -247,7 +304,7 @@ def model_6L_SF(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10):
     x = tf.concat([adj, nnlbl, att], 3)
     # Patchy-San
     x = g_conv_bn(x, cv1_theta, [1,bsize,nV,n1])
-    # Ego-Convolution
+    # Ego-Convolution - 5 ego convolution layers with weight tying
     x = tf.reshape(aggregate_nbr(nbr,x,k), [1,bsize,nV,k*n1])
     x = g_conv_bn(x, cv2_theta, [1,bsize,nV,n2])
     x = tf.reshape(aggregate_nbr(nbr, x, k), [1,bsize,nV,k*n2])
@@ -258,13 +315,14 @@ def model_6L_SF(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10):
     x = g_conv_bn(x, cv2_theta, [1,bsize,nV,n2])
     x = tf.reshape(aggregate_nbr(nbr,x,k), [1,bsize,nV,k*n2])
     x = g_conv_bn(x, cv2_theta, [1,bsize,nV,n2])
-    # fc
+    # fully connected
     x = tf.reshape(tf.transpose(x, [1,0,2,3]), [bsize,nV*n2])
     x = tf.nn.dropout(x, remain_rate)
     x = tf.nn.relu(tf.matmul(x, fc1_theta[0]) + fc1_theta[1])
     x = tf.nn.dropout(x, remain_rate)
     out = tf.matmul(x, fc2_theta[0]) + fc2_theta[1]
     return adj, nbr, nnlbl, att, label, out, params
+
 def model_3L(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10): # for visualization
     adj = tf.placeholder(tf.float32, [1,bsize,nV,pk*pk*dim_e])
     nnlbl = tf.placeholder(tf.float32, [1,bsize,nV,pk*dim_f])
@@ -295,6 +353,21 @@ def model_3L(nV, dim_f, dim_a, dim_e, bsize=32, k=10, nY=2, pk=10): # for visual
     x = tf.nn.dropout(x, remain_rate)
     out = tf.matmul(x, fc2_theta[0]) + fc2_theta[1]
     return adj, nbr, nnlbl, att, label, out, params
+
+'''
+starting point of the code
+k = k in ego cnn
+pk = k in patchy san
+labels.pkl, seems to be only used for compounds
+therefore, N = no of labels (relevant only when there are compounds)
+dim_f = no of node labels
+dim_a = atts[0][0].shape[1] [no of attributes?]
+dim_e = no of edge labels
+nV  = max number of neighbours of a node [Max degree]
+nY = no of unique labels?
+bsize = batch size (will be max 32 by default)
+
+'''
 def cv(name, lr=1e-3, bsize=32, max_epch=1000, patience=10, k=3, pk=10, gpu_frac=0.99, loop=5, FOLD=10, model_type='6L'):
     # load data
     nbrs = cPickle.load(open('{}/{}/{}-{}-conv.pkl'.format(DATASET_DIR, PROC_DIR, name, k), 'rb')) if 'Conv' in model_type else cPickle.load(open('{}/{}/{}-{}.pkl'.format(DATASET_DIR, PROC_DIR, name, k), 'rb'))
@@ -311,6 +384,7 @@ def cv(name, lr=1e-3, bsize=32, max_epch=1000, patience=10, k=3, pk=10, gpu_frac
     N, dim_f, dim_a, dim_e = len(labels), len(N_map), atts[0][0].shape[1] if atts[0][0] is not None else 0, len(E_map)
     dim_f = 0 if dim_f == 1 else dim_f
     dim_f = 0 if 'Compound' in name else dim_f
+    #nV = most number of neighbours
     nV = max([len(nbr) for nbr in nbrs])
     print('max #node={}, #nlabel={}, #elabel={}, #class={}'.format(nV, dim_f, dim_e, len(Y_map)))
     nY = len(set(labels))
